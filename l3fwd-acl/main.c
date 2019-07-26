@@ -251,6 +251,18 @@ enum {
 	RTE_ACL_IPV4VLAN_NUM
 };
 
+/*
+  @field type:  RTE_ACL_FIELD_TYPE__MASK - 用于像IP地址这种具有值和掩码字段
+		_RANGE - 用于像port这种具有上下限期间的字段
+		_BITMASK - 用于像协议标识符这种具有值和位掩码的字段
+
+  @field size:  注意，由于输入字节分组，必须将1或2字节的字段定义为构成4个连续输入字节的连续字段。
+  		并且，最好将8个或更多个字节的字段定义为4个字节字段，以便构建过程可以消除额外的字段。
+		
+  @field field_index: 第一个字段必须是1字节,其余保证为连续的4字节
+
+  @field offset: 输入缓冲区中(input buffer)的偏移量
+*/
 struct rte_acl_field_def ipv4_defs[NUM_FIELDS_IPV4] = {
 	{
 		.type = RTE_ACL_FIELD_TYPE_BITMASK,
@@ -421,10 +433,10 @@ RTE_ACL_RULE_DEF(acl4_rule, RTE_DIM(ipv4_defs));
 RTE_ACL_RULE_DEF(acl6_rule, RTE_DIM(ipv6_defs));
 
 struct acl_search_t {
-	const uint8_t *data_ipv4[MAX_PKT_BURST];
-	struct rte_mbuf *m_ipv4[MAX_PKT_BURST];
-	uint32_t res_ipv4[MAX_PKT_BURST];
-	int num_ipv4;
+	const uint8_t *data_ipv4[MAX_PKT_BURST];	// ACL输入数据，指针指向ipv4头的nest_proto_id字段
+	struct rte_mbuf *m_ipv4[MAX_PKT_BURST];		// mbuf结构
+	uint32_t res_ipv4[MAX_PKT_BURST];		// ACL查找结果
+	int num_ipv4;					// mbuf结构个数
 
 	const uint8_t *data_ipv6[MAX_PKT_BURST];
 	struct rte_mbuf *m_ipv6[MAX_PKT_BURST];
@@ -627,6 +639,7 @@ dump_ipv6_rules(struct acl6_rule *rule, int num, int extra)
 	}
 }
 
+// 将rte_mbuf中信息填入struct acl_search_t
 #ifdef DO_RFC_1812_CHECKS
 static inline void
 prepare_one_packet(struct rte_mbuf **pkts_in, struct acl_search_t *acl,
@@ -717,6 +730,7 @@ prepare_acl_parameter(struct rte_mbuf **pkts_in, struct acl_search_t *acl,
 static inline void
 send_one_packet(struct rte_mbuf *m, uint32_t res)
 {
+	// 不是ACL策略中拒绝通过的数据包
 	if (likely((res & ACL_DENY_SIGNATURE) == 0 && res != 0)) {
 		/* forward packets */
 		send_single_packet(m,
@@ -992,6 +1006,7 @@ parse_cb_ipv4vlan_rule(char *str, struct rte_acl_rule *v, int has_userdata)
 
 // 分配空间放入route和acl的rte_acl_rule结构体
 // 读取rule_path文件中的route和acl信息读入对应的rte_acl_rule结构体中
+// @param proute_base: 输出参数分配的*proute_num*个struct rte_acl_rule空间
 static int
 add_rules(const char *rule_path,
 		struct rte_acl_rule **proute_base,
@@ -1160,6 +1175,8 @@ setup_acl(struct rte_acl_rule *route_base,
 	if ((context = rte_acl_create(&acl_param)) == NULL)
 		rte_exit(EXIT_FAILURE, "Failed to create ACL context\n");
 
+	// 设置标量查找方式
+	// RTE_ACL_CLASSIFY_SCALAR: 通用实现，不需要任何特殊的硬件支持
 	if (parm_config.scalar && rte_acl_set_ctx_classify(context,
 			RTE_ACL_CLASSIFY_SCALAR) != 0)
 		rte_exit(EXIT_FAILURE,
@@ -1182,6 +1199,7 @@ setup_acl(struct rte_acl_rule *route_base,
 	if (rte_acl_build(context, &acl_build_param) != 0)
 		rte_exit(EXIT_FAILURE, "Failed to build ACL trie\n");
 
+	// 打印上下文信息，并不会打印规则(struct rte_acl_field_def中成员)
 	rte_acl_dump(context);
 
 	return context;
@@ -1206,8 +1224,7 @@ app_acl_init(void)
 	dump_acl_config();	// 打印acl配置信息
 
 	/* Load  rules from the input file */
-	// add_rules()中分配4类struct rte_acl_rule连续内存空间
-	//		返回申请的空间指针
+	// add_rules()中分配4类struct rte_acl_rule连续内存空间，返回申请的空间指针
 	if (add_rules(parm_config.rule_ipv4_name, &route_base_ipv4,
 			&route_num_ipv4, &acl_base_ipv4, &acl_num_ipv4,
 			sizeof(struct acl4_rule), &parse_cb_ipv4vlan_rule) < 0)
@@ -1257,6 +1274,8 @@ app_acl_init(void)
 		}
 	}
 
+	// 在每个socket上建立一个acl上下文
+	// *mapped*数组中为1的socket节点上都有一个相同的acl上下文
 	for (i = 0; i < NB_SOCKETS; i++) {
 		if (acl_config.mapped[i]) {
 			acl_config.acx_ipv4[i] = setup_acl(route_base_ipv4,
@@ -1285,12 +1304,13 @@ app_acl_init(void)
 
 /***********************end of ACL part******************************/
 
+// 每个核的配置
 struct lcore_conf {
 	uint16_t n_rx_queue;
 	struct lcore_rx_queue rx_queue_list[MAX_RX_QUEUE_PER_LCORE];
 	uint16_t n_tx_port;
-	uint16_t tx_port_id[RTE_MAX_ETHPORTS];
-	uint16_t tx_queue_id[RTE_MAX_ETHPORTS];
+	uint16_t tx_port_id[RTE_MAX_ETHPORTS];		// 每个核使用的端口id
+	uint16_t tx_queue_id[RTE_MAX_ETHPORTS];		// index：端口号		val：队列号
 	struct rte_eth_dev_tx_buffer *tx_buffer[RTE_MAX_ETHPORTS];
 } __rte_cache_aligned;
 
@@ -1480,6 +1500,8 @@ check_lcore_params(void)
 	return 0;
 }
 
+// 检查输入的lcore_param中的端口与-p端口掩码是否冲突
+// 检查输入的lcore_param中的端口是否可用
 static int
 check_port_config(void)
 {
@@ -1630,6 +1652,7 @@ parse_config(const char *q_arg)
 		if (size >= sizeof(s))
 			return -1;
 
+		// ".*s"表示下一参数为位宽
 		snprintf(s, sizeof(s), "%.*s", size, p);
 		if (rte_strsplit(s, sizeof(s), str_fld, _NUM_FLD, ',') !=
 				_NUM_FLD)
@@ -1665,6 +1688,18 @@ parse_args(int argc, char **argv)
 	char **argvopt;
 	int option_index;
 	char *prgname = argv[0];
+	/* 
+	 * struct option {
+               const char *name;
+               int         has_arg;
+               int        *flag;
+               int         val;
+           };
+           @field has_arg: no_argument(0), required_argument(1), required_argument(2)
+           
+           @field flag: 当*flag*为NULL,函数返回*val*。可以吧*val*设置成短选项，让函数返回短选项值
+           		当*flag*不为NULL，如果发现此长选项，*flag*指向*val*
+	 */
 	static struct option lgopts[] = {
 		{OPTION_CONFIG, 1, 0, 0},
 		{OPTION_NONUMA, 0, 0, 0},
@@ -1677,6 +1712,18 @@ parse_args(int argc, char **argv)
 
 	argvopt = argv;
 
+	/* 
+	   option_index: 返回匹配选项在*lgopts*中的索引
+	
+	   @return：匹配短选项时，返回短选项字符；
+	   	    匹配长选项时，*flag*为NULL时，返回val；否则，返回0
+           	    不匹配返回-1
+
+           getopt_long设置的全局变量：
+           	optarg——指向当前选项参数（如果有）的指针。
+           	optind——再次调用 getopt() 时的下一个 argv 指针的索引。
+           	optopt——最后一个已知选项。
+         */
 	while ((opt = getopt_long(argc, argvopt, "p:P",
 				lgopts, &option_index)) != EOF) {
 
@@ -1715,6 +1762,7 @@ parse_args(int argc, char **argv)
 				numa_on = 0;
 			}
 
+			// 借用硬件卸载，使用网卡硬件处理巨包
 			if (!strncmp(lgopts[option_index].name,
 					OPTION_ENBJMO, sizeof(OPTION_ENBJMO))) {
 				struct option lenopts = {
@@ -1792,6 +1840,8 @@ print_ethaddr(const char *name, const struct ether_addr *eth_addr)
 	printf("%s%s", name, buf);
 }
 
+// 在每个socket节点上建立pltmbuf_pool
+// @param nb_mbuf: 需要的最大mbuf数量
 static int
 init_mem(unsigned nb_mbuf)
 {
@@ -1946,6 +1996,7 @@ main(int argc, char **argv)
 		fflush(stdout);
 
 		nb_rx_queue = get_port_n_rx_queues(portid);
+		// 设置发送队列数与核数相同
 		n_tx_queue = nb_lcores;
 		if (n_tx_queue > MAX_TX_QUEUE_PER_PORT)
 			n_tx_queue = MAX_TX_QUEUE_PER_PORT;
@@ -1984,6 +2035,8 @@ main(int argc, char **argv)
 
 			/* Initialize TX buffers */
 			qconf = &lcore_conf[lcore_id];
+			// 在堆上分配空间，初始化为0，关联NUMA socket
+			// rte_dev_socket_id(protid); -> 找到端口连接的NUMA节点
 			qconf->tx_buffer[portid] = rte_zmalloc_socket("tx_buffer",
 					RTE_ETH_TX_BUFFER_SIZE(MAX_PKT_BURST), 0,
 					rte_eth_dev_socket_id(portid));
@@ -2020,6 +2073,7 @@ main(int argc, char **argv)
 					"rte_eth_tx_queue_setup: err=%d, "
 					"port=%d\n", ret, portid);
 
+			// 每个核在各个端口上使用同一队列号
 			qconf = &lcore_conf[lcore_id];
 			qconf->tx_queue_id[portid] = queueid;
 			queueid++;
@@ -2096,6 +2150,13 @@ main(int argc, char **argv)
 	check_all_ports_link_status(enabled_port_mask);
 
 	/* launch per-lcore init on every lcore */
+	/* @param call_master:  CALL_MASTER 主核调用函数
+				SKIP_MASTER 主核不调用函数
+
+	   @return：成功返回0，并在从核上运行函数
+	   	(-EBUSY)：至少一个远端核没有处于WAIT状态，
+	   		在这种情况下，核没有收到任何信息。
+	 */
 	rte_eal_mp_remote_launch(main_loop, NULL, CALL_MASTER);
 	RTE_LCORE_FOREACH_SLAVE(lcore_id) {
 		if (rte_eal_wait_lcore(lcore_id) < 0)
